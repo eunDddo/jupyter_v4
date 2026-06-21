@@ -87,6 +87,8 @@ def _state(g: dict[str, Any], user_message: str, user_id: str, thread_id: str,
         "sql_result": None,
         "final_answer": None,
         "execution_plan": None,
+        "task_planner_decision": None,
+        "sql_intent_decision": None,
         "orchestrator_decision": None,
         "active_task_id": None,
         "route": None,
@@ -136,6 +138,15 @@ def _answer(result: dict[str, Any]) -> str:
 def _artifact_status(result: dict[str, Any], name: str) -> str | None:
     artifact = (result.get("artifacts") or {}).get(name)
     return getattr(artifact, "status", None) if artifact else None
+
+
+def _sql_texts(sql: Any) -> list[str]:
+    if not sql:
+        return []
+    results = getattr(sql, "results", None) or []
+    if results:
+        return [(getattr(r, "sql", "") or "").lower() for r in results]
+    return [(getattr(sql, "sql", "") or "").lower()]
 
 
 def _jsonable(value: Any) -> Any:
@@ -193,6 +204,8 @@ def _trace_turn(result: dict[str, Any]) -> dict[str, Any]:
         "intake_decision": _jsonable(result.get("intake_decision")),
         "context_packet": _jsonable(result.get("context_packet")),
         "execution_plan": _jsonable(result.get("execution_plan")),
+        "task_planner_decision": _jsonable(result.get("task_planner_decision")),
+        "sql_intent_decision": _jsonable(result.get("sql_intent_decision")),
         "orchestrator_decision": _jsonable(result.get("orchestrator_decision")),
         "active_task_id": result.get("active_task_id"),
         "retry_counts": _jsonable(result.get("retry_counts")),
@@ -215,6 +228,14 @@ def _require(condition: bool, message: str, failures: list[str]) -> None:
         failures.append(message)
 
 
+def _check_citation_visible(result: dict[str, Any], failures: list[str]) -> None:
+    ev = result.get("evidence_bundle")
+    if ev and getattr(ev, "status", None) == "OK":
+        answer = _answer(result)
+        _require(bool(getattr(ev, "citations", None)), "Evidence OK인데 citations 없음", failures)
+        _require("[출처]" in answer or "[C1]" in answer, "최종 답변에 citation 표시 없음", failures)
+
+
 def _checks_intake_block(reason: str) -> Callable[[list[dict[str, Any]], dict[str, Any]], list[str]]:
     def check(results: list[dict[str, Any]], g: dict[str, Any]) -> list[str]:
         r = results[-1]
@@ -234,11 +255,16 @@ def _checks_intake_block(reason: str) -> Callable[[list[dict[str, Any]], dict[st
 def _check_safe_advice(results: list[dict[str, Any]], g: dict[str, Any]) -> list[str]:
     r = results[-1]
     failures: list[str] = []
+    tasks = _task_types(r)
+    answer = _answer(r)
     _require(_gate_status(r, "intake_gate") == "PASS", "안전 자문이 intake에서 PASS되지 않음", failures)
     _require(_gate_status(r, "evidence_gate") in {"PASS", "PASS_WITH_WARNINGS"}, "evidence_gate 통과/경고 아님", failures)
-    _require("evidence" in _task_types(r), "evidence task 없음", failures)
+    _require("prediction" not in tasks, f"안전 자문 단독 질문인데 prediction task가 생성됨: {tasks}", failures)
+    _require("[입력 부족]" not in answer, "안전 자문 답변에 입력 부족 섹션이 포함됨", failures)
+    _require("evidence" in tasks, "evidence task 없음", failures)
     _require(_gate_status(r, "output_safety_gate") == "PASS", "안전 자문 답변이 output_safety에서 막힘", failures)
-    _require("문서 근거" in _answer(r) or _artifact_status(r, "evidence") in {"OK", "EMPTY", "LOW_RELEVANCE"}, "문서 근거 섹션/아티팩트 없음", failures)
+    _require("문서 근거" in answer or _artifact_status(r, "evidence") in {"OK", "EMPTY", "LOW_RELEVANCE"}, "문서 근거 섹션/아티팩트 없음", failures)
+    _check_citation_visible(r, failures)
     return failures
 
 
@@ -255,6 +281,7 @@ def _check_combined(results: list[dict[str, Any]], g: dict[str, Any]) -> list[st
     _require("[위험 진단]" in answer or "[부분 위험 진단]" in answer, "위험 진단 섹션 없음", failures)
     _require("[과거 이력]" in answer, "과거 이력 섹션 없음", failures)
     _require("[문서 근거]" in answer, "문서 근거 섹션 없음", failures)
+    _check_citation_visible(r, failures)
     return failures
 
 
@@ -263,7 +290,7 @@ def _check_combined_sql_table(expected_tables: set[str]) -> Callable[[list[dict[
         failures = _check_combined(results, g)
         r = results[-1]
         sql = r.get("sql_result")
-        sql_text = (getattr(sql, "sql", "") or "").lower()
+        sql_text = "\n".join(_sql_texts(sql))
         _require(
             bool(sql_text) and any(table.lower() in sql_text for table in expected_tables),
             f"SQL이 기대 테이블을 사용하지 않음: expected={sorted(expected_tables)}, sql={sql_text}",
@@ -280,12 +307,21 @@ def _check_sql_ok(results: list[dict[str, Any]], g: dict[str, Any]) -> list[str]
     _require("sql" in _task_types(r), "sql task 없음", failures)
     _require(sql is not None, "sql_result 없음", failures)
     _require(sql is not None and sql.status in {"OK", "EMPTY"}, f"sql status 이상: {getattr(sql, 'status', None)} / {getattr(sql, 'error_message', None)}", failures)
-    if sql and sql.sql:
+    for sql_text in _sql_texts(sql):
         try:
-            g["validate_sql_query"](sql.sql, g["DEFAULT_SQL_DEPS"])
+            g["validate_sql_query"](sql_text, g["DEFAULT_SQL_DEPS"])
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"SQL policy 검증 실패: {exc} | sql={sql.sql}")
+            failures.append(f"SQL policy 검증 실패: {exc} | sql={sql_text}")
     _require(_gate_status(r, "sql_gate") in {"PASS", "PASS_WITH_WARNINGS"}, "sql_gate 통과/경고 아님", failures)
+    return failures
+
+
+def _check_sql_alarm_and_maintenance(results: list[dict[str, Any]], g: dict[str, Any]) -> list[str]:
+    r = results[-1]
+    failures = _check_sql_ok(results, g)
+    joined = "\n".join(_sql_texts(r.get("sql_result")))
+    _require("alarm_logs" in joined, "알람 로그 요청인데 alarm_logs 조회가 없음", failures)
+    _require("maintenance_history" in joined, "정비 이력 요청인데 maintenance_history 조회가 없음", failures)
     return failures
 
 
@@ -298,6 +334,7 @@ def _check_sql_evidence_ok(results: list[dict[str, Any]], g: dict[str, Any]) -> 
     _require(_gate_status(r, "output_safety_gate") == "PASS", "output_safety_gate PASS 아님", failures)
     _require("[과거 이력]" in _answer(r), "과거 이력 섹션 없음", failures)
     _require("[문서 근거]" in _answer(r), "문서 근거 섹션 없음", failures)
+    _check_citation_visible(r, failures)
     return failures
 
 
@@ -307,6 +344,10 @@ def _check_sql_evidence_strict_ok(results: list[dict[str, Any]], g: dict[str, An
     sql = r.get("sql_result")
     _require(sql is not None and sql.status == "OK", f"SQL 결과가 OK가 아님: {getattr(sql, 'status', None)}", failures)
     _require(sql is not None and bool(sql.rows), "SQL OK인데 rows가 비어 있음", failures)
+    ev = r.get("evidence_bundle")
+    evidence_reports = [x for x in r.get("gate_reports", []) if x.get("gate_name") == "evidence_gate"]
+    if ev and ev.status in {"EMPTY", "LOW_RELEVANCE"}:
+        _require(any(x.get("status") == "RETRYABLE_FAIL" for x in evidence_reports), "근거 요청 EMPTY인데 evidence retry가 수행되지 않음", failures)
     return failures
 
 
@@ -318,11 +359,11 @@ def _check_sql_empty(results: list[dict[str, Any]], g: dict[str, Any]) -> list[s
     _require("prediction" not in _task_types(r), "이력 조회 전용 질문에서 prediction task가 생성됨", failures)
     _require(sql is not None, "sql_result 없음", failures)
     _require(sql is not None and sql.status == "EMPTY", f"SQL EMPTY가 아님: {getattr(sql, 'status', None)} / {getattr(sql, 'summary', None)}", failures)
-    if sql and sql.sql:
+    for sql_text in _sql_texts(sql):
         try:
-            g["validate_sql_query"](sql.sql, g["DEFAULT_SQL_DEPS"])
+            g["validate_sql_query"](sql_text, g["DEFAULT_SQL_DEPS"])
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"SQL policy 검증 실패: {exc} | sql={sql.sql}")
+            failures.append(f"SQL policy 검증 실패: {exc} | sql={sql_text}")
     _require(_gate_status(r, "sql_gate") == "PASS_WITH_WARNINGS", "EMPTY SQL의 sql_gate가 PASS_WITH_WARNINGS가 아님", failures)
     _require("[과거 이력]" in _answer(r), "EMPTY SQL 답변에 과거 이력 섹션 없음", failures)
     return failures
@@ -385,6 +426,39 @@ def _check_multiturn_combined_followup(results: list[dict[str, Any]], g: dict[st
     _require("[위험 진단]" in answer or "[부분 위험 진단]" in answer, "복합 멀티턴 위험 진단 섹션 없음", failures)
     _require("[과거 이력]" in answer, "복합 멀티턴 과거 이력 섹션 없음", failures)
     _require("[문서 근거]" in answer, "복합 멀티턴 문서 근거 섹션 없음", failures)
+    _check_citation_visible(second, failures)
+    return failures
+
+
+def _check_multiturn_sql_followup(results: list[dict[str, Any]], g: dict[str, Any]) -> list[str]:
+    first, second = results
+    failures: list[str] = []
+    _require(_artifact_status(first, "sql") == "OK", "SQL 멀티턴 1턴 sql 조회 실패", failures)
+    packet = second.get("context_packet")
+    _require(packet is not None, "SQL 멀티턴 2턴 context_packet 없음", failures)
+    _require(packet is not None and bool(getattr(packet, "previous_sql_summary", None)), "이전 SQL artifact summary가 context_packet에 없음", failures)
+    tasks = _task_types(second)
+    _require("sql" in tasks, f"SQL follow-up인데 sql task가 생성되지 않음: {tasks}", failures)
+    sql = second.get("sql_result")
+    _require(sql is not None and sql.status in {"OK", "EMPTY"}, f"SQL follow-up status 이상: {getattr(sql, 'status', None)}", failures)
+    sql_text = "\n".join(_sql_texts(sql))
+    _require("m-1001" in sql_text.lower(), f"후속 질문에서 이전 설비 ID를 SQL에 반영하지 못함: {sql_text}", failures)
+    _require("alarm_logs" in sql_text or "maintenance_history" in sql_text, f"후속 SQL이 이전 이력 문맥을 반영하지 못함: {sql_text}", failures)
+    _require("[과거 이력]" in _answer(second), "SQL follow-up 답변에 과거 이력 섹션 없음", failures)
+    return failures
+
+
+def _check_multiturn_evidence_followup(results: list[dict[str, Any]], g: dict[str, Any]) -> list[str]:
+    first, second = results
+    failures: list[str] = []
+    _require(_artifact_status(first, "evidence") in {"OK", "EMPTY", "LOW_RELEVANCE"}, "Evidence 멀티턴 1턴 evidence artifact 없음", failures)
+    packet = second.get("context_packet")
+    _require(packet is not None, "Evidence 멀티턴 2턴 context_packet 없음", failures)
+    _require(packet is not None and bool(getattr(packet, "previous_evidence_summary", None)), "이전 Evidence artifact summary가 context_packet에 없음", failures)
+    tasks = _task_types(second)
+    _require("evidence" in tasks, f"Evidence follow-up인데 evidence task가 생성되지 않음: {tasks}", failures)
+    _require(_artifact_status(second, "evidence") in {"OK", "EMPTY", "LOW_RELEVANCE"}, f"Evidence follow-up status 이상: {_artifact_status(second, 'evidence')}", failures)
+    _require("[문서 근거]" in _answer(second), "Evidence follow-up 답변에 문서 근거 섹션 없음", failures)
     return failures
 
 
@@ -443,7 +517,7 @@ def scenarios() -> list[Scenario]:
             sid="S05_sql_alarm_history",
             description="M-1001 최근 30일 알람/정비 이력 SQL 조회",
             turns=[Turn("2026-06-21 기준 M-1001 최근 30일 알람 로그와 정비 이력을 조회해서 요약해줘.")],
-            check=_check_sql_ok,
+            check=_check_sql_alarm_and_maintenance,
             tags=["sql"],
         ),
         Scenario(
@@ -533,6 +607,26 @@ def scenarios() -> list[Scenario]:
             check=_check_multiturn_combined_followup,
             tags=["multiturn", "combined", "prediction", "sql", "rag"],
         ),
+        Scenario(
+            sid="S16_multiturn_sql_history_followup",
+            description="2턴 SQL 후속질문에서 이전 SQL artifact와 설비 ID를 context로 사용",
+            turns=[
+                Turn("2026-06-21 기준 M-1001 최근 30일 알람 로그와 정비 이력을 조회해서 요약해줘."),
+                Turn("그 알람 중 HIGH만 다시 보고, 관련 정비 조치도 이어서 정리해줘."),
+            ],
+            check=_check_multiturn_sql_followup,
+            tags=["multiturn", "sql", "context"],
+        ),
+        Scenario(
+            sid="S17_multiturn_evidence_followup",
+            description="2턴 문서 후속질문에서 이전 Evidence artifact를 context로 사용",
+            turns=[
+                Turn("M-1001 공구 마모와 스핀들 채터 점검 방법에 대한 문서 근거를 찾아줘."),
+                Turn("방금 근거 기준으로 재발 방지 절차만 더 구체적으로 정리해줘."),
+            ],
+            check=_check_multiturn_evidence_followup,
+            tags=["multiturn", "rag", "context"],
+        ),
     ]
 
 
@@ -570,8 +664,17 @@ def summarize_result(
         "evidence_status": _artifact_status(last, "evidence") if last else None,
         "sql_status": _artifact_status(last, "sql") if last else None,
         "sql": getattr(sql, "sql", None) if sql else None,
+        "sql_results": [
+            {
+                "query_type": getattr(r, "query_type", None),
+                "sql": getattr(r, "sql", None),
+                "rows": len(getattr(r, "rows", []) or []),
+                "summary": getattr(r, "summary", ""),
+            }
+            for r in (getattr(sql, "results", None) or [])
+        ] if sql else [],
         "sql_error": getattr(sql, "error_message", None) if sql else None,
-        "answer_preview": _answer(last).replace("\n", " ")[:220] if last else "",
+        "answer_preview": _answer(last).replace("\n", " ")[:1200] if last else "",
     }
     if include_full_answer:
         summary["answer"] = _answer(last) if last else ""
@@ -581,7 +684,7 @@ def summarize_result(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run 15 manufacturing agent scenario tests against manufacturing_agent_v6.ipynb.")
+    parser = argparse.ArgumentParser(description="Run 17 manufacturing agent scenario tests against manufacturing_agent_v6.ipynb.")
     parser.add_argument("--scenario", action="append", help="Run only selected scenario id. Can be repeated.")
     parser.add_argument("--json", action="store_true", help="Print full JSON summary.")
     parser.add_argument("--full-answer", action="store_true", help="Print and include each scenario's full final answer.")
@@ -637,6 +740,9 @@ def main() -> int:
                 print(f"    {line}")
         if summary.get("sql"):
             print(f"  sql={summary['sql']}")
+        if summary.get("sql_results"):
+            compact = [(r["query_type"], r["rows"]) for r in summary["sql_results"]]
+            print(f"  sql_results={compact}")
         if summary.get("sql_error"):
             print(f"  sql_error={summary['sql_error']}")
         if summary.get("trace_file"):
