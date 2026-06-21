@@ -134,7 +134,7 @@ LLM은 다음 위치에서만 typed decision 또는 요약에 사용된다.
 | 병렬 실행 | 아직 순차 dispatcher 중심 | `prediction`, `sql`, `evidence` dependency가 없을 때 LangGraph fan-out 병렬화 가능 |
 | Hierarchical Supervisor | 아님 | SQL/RAG/Safety가 더 커지면 각 subgraph 내부에 local planner/gate 추가 |
 | LLM Compiler | 전체 구조에는 미적용 | evidence query expansion, SQL multi-query planning 같은 제한 영역에만 적용 가능 |
-| state 직렬화 | Pydantic 객체가 checkpointer warning 유발 | state에는 dict 저장, node 진입 시 Pydantic 재검증 |
+| state 직렬화 | `JsonPlusSerializer` allowlist로 현재 Pydantic state 타입을 명시 허용 | 운영 strict 모드에서는 allowlist 유지 또는 dict 저장/재검증 방식으로 확장 |
 | quality evaluation | gate 중심 | 답변 품질용 `quality_gate`를 별도 추가 가능 |
 | recovery 정책 | 기본 retry 중심 | retry 실패 시 제한 답변, 추가 입력 요청, escalation policy를 더 명확히 분리 |
 
@@ -545,11 +545,32 @@ app.invoke(None, config=same_config)
 - `run_turn(..., resume_on_error=True, max_resume_attempts=1)`: 실행 중 실패하면 같은 config로 checkpoint resume 1회 시도
 - `resume_turn(user_id, thread_id, request_id="resume")`: 이미 실패한 thread를 새 input 없이 checkpoint에서 이어 실행
 
+체크포인터는 `make_sqlite_saver()`로 생성한다.
+
+```python
+def make_checkpoint_serde() -> JsonPlusSerializer:
+    return JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINT_SAFE_TYPES)
+
+def make_sqlite_saver(path: str = CHECKPOINT_DB) -> SqliteSaver:
+    conn = sqlite3.connect(path, check_same_thread=False)
+    return SqliteSaver(conn, serde=make_checkpoint_serde())
+```
+
+`CHECKPOINT_SAFE_TYPES`에는 `ExecutionPlan`, `TaskSpec`, `ContextPacket`, `PredictionResult`, `EvidenceArtifact`, `SQLHistoryArtifact`, `FinalAnswer`, `GateReport` 등 현재 state에 저장되는 Pydantic 타입을 명시한다. 이 방식은 checkpoint에 커스텀 타입을 저장하되 LangGraph msgpack deserializer가 해당 타입을 unregistered로 경고하지 않게 한다.
+
 주의할 점:
 
 - 새 사용자 요청은 `make_initial_state(...)`로 시작한다.
 - 실패한 동일 요청을 이어 실행할 때는 새 state를 넣지 않고 `None` input으로 resume한다.
 - `checkpoint_ns`는 branch를 나누고 싶을 때만 사용한다. 기본값은 기존 checkpoint와 호환되도록 빈 문자열이다.
+
+회귀 테스트:
+
+- `S22_sqlite_checkpoint_resume`
+  - `interrupt_before=["sql_agent"]`로 SQL 직전 checkpoint 생성
+  - SQLite checkpoint DB를 닫았다가 다시 열어 새 graph app 생성
+  - 같은 `thread_id`와 config로 `invoke(None, config)` 실행
+  - `sql_result.status == OK`, `sql_gate == PASS/PASS_WITH_WARNINGS`, `final_answer` 생성, 남은 node 없음 검증
 
 ## 14. LLM 사용 위치 요약
 
@@ -593,20 +614,16 @@ app.invoke(None, config=same_config)
 최근 검증 결과:
 
 ```text
-Scenario result: 17/17 passed
+S18/S19/S20 structure regression: 3/3 passed
+S22 SQLite checkpoint resume: 1/1 passed
 ```
 
 ## 15. 주의할 기술부채
 
-현재 LangGraph checkpointer 실행 중 커스텀 Pydantic 객체 역직렬화 warning이 발생할 수 있다.
+현재는 `JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINT_SAFE_TYPES)`로 커스텀 Pydantic 객체 역직렬화 warning을 줄였다.
 
-의미:
+남은 기술부채:
 
-- 지금 실행 실패는 아니다.
-- 향후 `LANGGRAPH_STRICT_MSGPACK=true` 같은 strict 환경에서는 문제가 될 수 있다.
-
-개선 방향:
-
-- checkpointer에 저장되는 Pydantic 객체를 `model_dump()` 기반 dict로 직렬화
-- 복원 시 필요한 노드에서 다시 Pydantic model로 validate
-- 특히 `ExecutionPlan`, `ContextPacket`, `PredictionResult`, `EvidenceArtifact`, `SQLHistoryArtifact`, `FinalAnswer`를 우선 검토
+- allowlist는 현재 노트북 런타임의 Pydantic 타입을 신뢰하는 방식이다. checkpoint DB를 외부 비신뢰 입력으로 취급해야 하는 운영 환경에서는 더 보수적인 정책이 필요하다.
+- 더 강한 방식은 state에 `model_dump()` 기반 dict만 저장하고, node 진입 시 필요한 타입으로 `model_validate()`하는 것이다.
+- 이 리팩토링은 `ExecutionPlan`, `ContextPacket`, `PredictionResult`, `EvidenceArtifact`, `SQLHistoryArtifact`, `FinalAnswer` 접근부를 모두 hydrate-safe하게 바꿔야 하므로 별도 작업으로 분리하는 것이 맞다.

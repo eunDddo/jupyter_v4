@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import types
 from dataclasses import dataclass, field
@@ -539,6 +540,75 @@ def _check_plan_and_execute_replan(results: list[dict[str, Any]], g: dict[str, A
     return failures
 
 
+def _check_sqlite_checkpoint_resume(results: list[dict[str, Any]], g: dict[str, Any]) -> list[str]:
+    failures: list[str] = []
+
+    def generated_query(query_type: str, sql_query: str) -> Any:
+        return g["SQLGeneratedQuery"](
+            query_type=query_type,
+            purpose=f"{query_type} checkpoint resume query",
+            sql_query=sql_query,
+            explanation="checkpoint resume fake text_to_sql_runner output",
+        )
+
+    def fake_text_to_sql_runner(*args: Any, **kwargs: Any) -> Any:
+        return g["SQLSuccess"](
+            queries=[
+                generated_query(
+                    "failure_history",
+                    "SELECT id, event_date, failure_type, severity, component, symptom, root_cause, corrective_action, preventive_action, downtime_min "
+                    "FROM failure_history WHERE event_date >= '2026-05-22' ORDER BY event_date DESC LIMIT 50",
+                )
+            ],
+            reason_summary="checkpoint resume SQL success",
+        )
+
+    with tempfile.TemporaryDirectory(prefix="mfg-agent-checkpoint-") as tmp:
+        checkpoint_db = str(Path(tmp) / "checkpoint.sqlite")
+        user_id = "checkpoint-user"
+        thread_id = f"checkpoint-thread-{int(time.time() * 1000)}"
+        request_id = "checkpoint-resume-1"
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "user_id": user_id,
+                "request_id": request_id,
+                "text_to_sql_runner": fake_text_to_sql_runner,
+            },
+            "recursion_limit": 60,
+        }
+        turn = Turn("2026-06-21 기준 최근 30일 고장 이력과 대응 방식을 조회해서 요약해줘.")
+        state = _state(turn.message, user_id, thread_id, request_id)
+
+        saver = g["make_sqlite_saver"](checkpoint_db)
+        try:
+            app = g["build_graph"](checkpointer=saver)
+            interrupted = app.invoke(state, config=config, interrupt_before=["sql_agent"])
+            snapshot = app.get_state(config)
+            _require("sql_agent" in tuple(snapshot.next or ()), f"SQL 직전 interrupt checkpoint가 아님: next={snapshot.next}", failures)
+            _require(not interrupted.get("sql_result"), "interrupt_before sql_agent인데 sql_result가 이미 생성됨", failures)
+        finally:
+            saver.conn.close()
+
+        saver = g["make_sqlite_saver"](checkpoint_db)
+        try:
+            resumed_app = g["build_graph"](checkpointer=saver)
+            resumed = resumed_app.invoke(None, config=config)
+            resumed_snapshot = resumed_app.get_state(config)
+        finally:
+            saver.conn.close()
+
+        sql = resumed.get("sql_result")
+        final_answer = resumed.get("final_answer")
+        _require(sql is not None and sql.status == "OK", f"resume 후 SQL OK가 아님: {getattr(sql, 'status', None)} / {getattr(sql, 'error_message', None)}", failures)
+        _require(final_answer is not None and bool(final_answer.answer), "resume 후 final_answer가 생성되지 않음", failures)
+        _require(_gate_status(resumed, "sql_gate") in {"PASS", "PASS_WITH_WARNINGS"}, "resume 후 sql_gate 통과/경고 아님", failures)
+        _require(not tuple(resumed_snapshot.next or ()), f"resume 후 남은 node가 있음: {resumed_snapshot.next}", failures)
+        _require("failure_history" in "\n".join(_sql_texts(sql)), "resume 후 SQL이 failure_history를 사용하지 않음", failures)
+
+    return failures
+
+
 FEATURES_HIGH_RISK = {
     "type": "M",
     "air_temperature": 298.0,
@@ -572,6 +642,7 @@ def scenarios() -> list[Scenario]:
         Scenario("S19_text_to_sql_rag_quality", "FailureHistory Text-to-SQL과 RAG 품질 회귀 테스트", [], _check_text_to_sql_and_rag_quality, mode="node", tags=["sql", "rag", "quality"]),
         Scenario("S20_plan_and_execute_replan", "Gate-driven Plan-and-Execute targeted replan 회귀 테스트", [], _check_plan_and_execute_replan, mode="node", tags=["orchestration", "replan"]),
         Scenario("S21_broad_problem_lookup_feature_context", "전체 문제 영역 조회는 이전 입력 피처를 SQL scope로 오염시키지 않음", [Turn("Type M 피처 샘플이야. 공기온도 298, 공정온도 309, 회전속도 1320, 토크 62, 공구마모 215로 위험 진단해줘.", FEATURES_HIGH_RISK), Turn("최근에 문제 있었던 곳 조회해줘.")], _check_broad_problem_lookup_feature_context, tags=["multiturn", "context", "sql"]),
+        Scenario("S22_sqlite_checkpoint_resume", "SQLite checkpoint에서 SQL 직전 중단 후 같은 thread_id로 이어 실행", [], _check_sqlite_checkpoint_resume, mode="node", tags=["checkpoint", "resume", "sql"]),
     ]
 
 
