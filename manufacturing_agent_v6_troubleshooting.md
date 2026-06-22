@@ -438,7 +438,7 @@ SQL Agent가 담당하는 것:
 - 고장 유형별 반복 패턴
 - corrective action / preventive action 조회
 - 현재 prediction failure_type과 유사한 과거 사례 조회
-- downtime / severity / component 기반 요약
+- downtime / component 기반 요약
 
 SQL Agent가 담당하지 않는 것:
 
